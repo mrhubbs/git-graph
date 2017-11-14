@@ -1,0 +1,222 @@
+#!/usr/bin/ruby
+
+require 'colorize'
+require 'digest/sha1'
+require 'pathname'
+
+# TODO: show remote branches without local trakcing branches
+
+def distance_of_time_in_words(num_secs)
+  s = num_secs
+  # 0 <-> 29 secs                                                             # => less than a minute
+  # 30 secs <-> 1 min, 29 secs                                                # => 1 minute
+  # 1 min, 30 secs <-> 44 mins, 29 secs                                       # => [2..44] minutes
+  # 44 mins, 30 secs <-> 89 mins, 29 secs                                     # => about 1 hour
+  # 89 mins, 30 secs <-> 23 hrs, 59 mins, 29 secs                             # => about [2..24] hours
+  # 23 hrs, 59 mins, 30 secs <-> 41 hrs, 59 mins, 29 secs                     # => 1 day
+  # 41 hrs, 59 mins, 30 secs  <-> 29 days, 23 hrs, 59 mins, 29 secs           # => [2..29] days
+  # 29 days, 23 hrs, 59 mins, 30 secs <-> 44 days, 23 hrs, 59 mins, 29 secs   # => about 1 month
+  # 44 days, 23 hrs, 59 mins, 30 secs <-> 59 days, 23 hrs, 59 mins, 29 secs   # => about 2 months
+  # 59 days, 23 hrs, 59 mins, 30 secs <-> 1 yr minus 1 sec                    # => [2..12] months
+  # 1 yr <-> 1 yr, 3 months                                                   # => about 1 year
+  # 1 yr, 3 months <-> 1 yr, 9 months                                         # => over 1 year
+  # 1 yr, 9 months <-> 2 yr minus 1 sec                                       # => almost 2 years
+  # 2 yrs <-> max time or date                                                # => (same rules as 1 yr)
+end
+
+# Returns an absolute path to the .git directory for the current folder.
+# Exits if the current directory isn't part of a repo.
+# Can handle submodules.
+def git_git_dir()
+  stub = './'
+  was_mountpoint = false
+
+  while true
+    dir = File.join(stub, '.git')
+
+    # is there a .git directory?
+    if Dir.exists? dir then
+      return File.expand_path dir
+    # is there a .git file?
+    elsif File.exists? dir then
+      gitdir = File.open(dir).read().match('gitdir: (.*)').captures[0]
+      return File.expand_path File.join(stub, gitdir)
+    else
+      # back up one directory
+      stub = File.join('..', stub)
+
+      # stop when we've backed out of the filesystem
+      if was_mountpoint then
+        puts 'fatal: Not a git repository (or any of the parent directories): .git'
+        exit(128)
+      end
+      if Pathname.new(File.expand_path stub).mountpoint?
+        was_mountpoint = true
+      end
+    end
+  end
+end
+
+# git the refs
+# returns an array of arrays of [BRANCH NAME, COMMIT HASH]
+def git_refs()
+  # This glob pattern matches recursively so we will find a branch named
+  # something like 'feature/subfeature/the-cool-feature'.
+  # TODO: get remotes also
+  git_dir = git_git_dir()
+
+  locals = Dir.glob(File.join(git_dir, 'refs', 'heads', '**', '*')).select do |f|
+    !File.directory? f
+  end.map do |f|
+    {
+      'name' => f.split('/refs/heads/')[1],
+      'hash' => File.open(f).read().rstrip
+    }
+  end
+
+  remotes = Dir.glob(File.join(git_dir, 'refs', 'remotes', '**', '*')).select do |f|
+    !File.directory?(f) and !f.end_with? "/HEAD"
+  end.map do |f|
+    {
+      'name' => f.split('/refs/remotes/')[1],
+      'hash' => File.open(f).read().rstrip
+    }
+  end
+
+  locals + remotes
+end
+
+# gets the object for the given hash
+# TODO: maybe learn to parse objects instead of relying on git commands?
+# first_two = hash[0..1]
+# remainder = hash[2..-1]
+# object = File.open(File.join('.git', 'objects', first_two, remainder))
+# (If we do that, we'll need to handle packed objects)
+def git_object(hash)
+  return `git cat-file -p #{hash}`
+end
+
+def git_timestamp(pretty_contents)
+  # get the timestamp
+  # find the timestamp for the authored line
+  # TODO: should we user the committer instead?
+  timestamp = pretty_contents.match(/^author .+\> ([0-9]+ [-,+][0-9]+)$/).captures()[0]
+  seconds, offset = timestamp.split(' ')
+  Time.at(Integer(seconds) + Integer(offset))
+end
+
+def git_branches()
+  return git_refs().map do |branch|
+    object = git_object(branch['hash'])
+    {
+      'name' => branch['name'],
+      'hash' => branch['hash'],
+      'timestamp' => git_timestamp(object),
+      'summary' => object.match(/^committer.*\n\n(.*)/).captures()[0],
+      'author' => object.match(/^author (.*) \</).captures()[0]
+    }
+  end
+end
+
+# sort in older of newest to oldest
+branches = git_branches().sort do |a, b|
+  b['timestamp'] <=> a['timestamp']
+end
+
+# TODO: combine branches that are on the same commit
+
+def cap_text(text, limit)
+  if text.length > limit then
+    return text[0..limit-2] + "…"
+  end
+
+  return "%-#{limit}s" % text
+end
+
+# Creates an identicon from the given text by hashing it,
+# capping the hash at the length, and subbing symbols for the hex characters.
+# NOTE: it's probably a good idea not to go below length = 4
+def make_identicon(text, length = 4)
+  hash = Digest::SHA1.hexdigest(text)[0..length-1].downcase
+
+  # converts hex to a semi-random choice of symbolic characters
+  subs = {
+    'a' => '~',
+    'b' => '<',
+    'c' => '{',
+    'd' => '}',
+    'e' => '|',
+    'f' => ':',
+    '0' => ')',
+    '1' => '=',
+    '2' => '@',
+    '3' => '#',
+    '4' => '$',
+    '5' => '>',
+    '6' => '^',
+    '7' => '&',
+    '8' => '*',
+    '9' => '(',
+  }
+
+  # when mirroring we actually swap characters that have mirrors
+  mirror_subs = {
+    '{' => '}',
+    '}' => '{',
+    '(' => ')',
+    ')' => '(',
+    '<' => '>',
+    '>' => '<'
+  }
+
+  # every mirrored character in the middle is replaced by a non-mirrored
+  # character so we look more symmetrical
+  middle_subs = {
+    '{' => '|',
+    '}' => ':',
+    '(' => '#',
+    ')' => '$',
+    '<' => '^',
+    '>' => '!'
+  }
+
+  # mirror the hash because the eye will more easily identify symetrical shapes
+  middle_char = subs[hash[hash.length-1]]
+  first_half = (hash.chars[0..hash.length-2].map { |c| subs[c] }).join('') + middle_subs.fetch(middle_char, middle_char)
+  second_half = (first_half[0..first_half.length-2].chars.map { |c| mirror_subs.fetch(c, c) }).reverse().join ''
+  identicon = first_half + second_half
+
+  # do an analysis of the hash to determine what color it should be
+  hashi = Integer(hash, 16)
+  if hashi > 0xd000 then
+    return identicon.blue
+  elsif hashi > 0xb000 then
+    return identicon.green
+  elsif hashi > 0xa000 then
+    return identicon.cyan
+  elsif hashi > 0x7000 then
+    return identicon.yellow
+  elsif hashi > 0x4000 then
+    return identicon.magenta
+  else
+    return identicon.red
+  end
+end
+
+def pretty_show_branches(branches)
+  branches.each do |branch|
+    name = cap_text(branch['name'], 40)
+
+    identicon = make_identicon(branch['author'])
+
+    line = name.yellow + '  ' + \
+      identicon.bold + '  ' + \
+      cap_text(branch['summary'], 75).white + '  ' + \
+      "(#{branch['timestamp']})".green + \
+      " - #{branch['author']}"
+
+    puts line
+  end
+end
+
+pretty_show_branches(branches)
